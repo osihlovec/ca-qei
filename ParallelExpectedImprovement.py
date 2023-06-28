@@ -5,36 +5,37 @@ import numpy as np
 from utils import chebyshev_scalar, chebyshev_scalar_batch, rescale, calculate_cost
 
 
-class ExpectedGradientCalculator():
-    def __init__(self, observed_x, observed_y1, observed_y2, min_val, min_x, max_x, reference, q = 8, iterations = 30, epochs = 50, restarts = 10, 
+class ExpectedImprovementCalculator():
+    def __init__(self, observed_x, observed_y1, observed_y2, max_val, min_x, max_x, reference, q = 8, iterations = 30, epochs = 50, restarts = 10, 
                  mc = 10, noise = 0.00001, alpha = 1, gamma = 2, cost_aware = True, weights = None, utilities = torch.tensor([0.5, 0.5]), version = 1, 
                  device = torch.device('cpu'), misspecified = False, seed = 0, normalization = 10):
-        self.min_val = min_val.to(torch.double)
-        self.min_x = min_x
-        self.max_x = max_x
-        self.reference = reference.to(torch.double)
-        self.q = q
-        self.iterations = iterations
-        self.epochs = epochs
-        self.restarts = restarts
-        self.mc = mc
-        self.noise = noise
-        self.alpha = alpha
-        self.gamma = gamma
-        self.cost_aware = cost_aware
-        self.sampler = LatinHypercube(d = observed_x.size(dim = 1), seed = seed)
-        self.observed_x = observed_x.to(torch.double)
-        self.model1 = FixedNoiseGP(observed_x, observed_y1, torch.full_like(observed_y1, noise))
-        self.model2 = FixedNoiseGP(observed_x, observed_y2, torch.full_like(observed_y2, noise))
-        self.weights = weights
-        self.utilities = utilities
-        self.version = version
-        self.device = device
-        self.misspecified = misspecified
+        self.max_val = max_val.to(torch.double) # most optimal input thus far
+        self.min_x = min_x # lower bound of the input space per dimension
+        self.max_x = max_x # upper bound of the input space per dimension
+        self.reference = reference.to(torch.double) # reference point (reservation utilities) for chebyshev scalarization
+        self.q = q # batch size (degree of parallelism)
+        self.iterations = iterations # number of iterations (samples) used to estimate the gradient
+        self.epochs = epochs # number of optimizer (ADAM) steps
+        self.restarts = restarts # number of initializations to avoid local optima
+        self.mc = mc # number of monte carlo epochs to estimate expected gradient
+        self.noise = noise # distortion of the objective output 
+        self.alpha = alpha # currently unusued, but scales the gradient
+        self.gamma = gamma # currently unusued, but can be used to regularize the gradient
+        self.cost_aware = cost_aware # controls between cost-aware and cost-agnostic
+        self.sampler = LatinHypercube(d = observed_x.size(dim = 1), seed = seed) # sampler of initial points (restarts)
+        self.observed_x = observed_x.to(torch.double) # tensor of previously queried datapoints
+        self.model1 = FixedNoiseGP(observed_x, observed_y1, torch.full_like(observed_y1, noise)) # GP of the first objective function
+        self.model2 = FixedNoiseGP(observed_x, observed_y2, torch.full_like(observed_y2, noise)) # GP of the second objective function
+        self.weights = weights # weights (relative costs) of the input dimensions
+        self.utilities = utilities # utilities of the two objectives that shape the final (scalarized) utility
+        self.version = version # switches the internal optimizer
+        self.device = device # GPU or CPU
+        self.misspecified = misspecified # standard or delayed environment
         self.seed = seed
-        self.normalization = normalization
+        self.normalization = normalization # normalization constant for the cost function
     
     def rbf_covariance(self, x, y):
+        # calculates the covariance matrix
         k_xx = torch.exp((torch.linalg.norm((x.unsqueeze(1)-x), dim=2, ord=2) ** 2) / (-2))
         k_xy = torch.exp((torch.linalg.norm((x.unsqueeze(1)-y), dim=2, ord=2) ** 2) / (-2))
         k_yy = torch.exp((torch.linalg.norm((y.unsqueeze(1)-y), dim=2, ord=2) ** 2) / (-2))
@@ -42,6 +43,8 @@ class ExpectedGradientCalculator():
         return k_xx - k_xy @ torch.inverse(k_yy) @ k_xy.T
     
     def function_h(self, x):
+        # returns the improvement of the selected input over the best-found datapoint
+        
          # compute means
          m1 = self.model1.posterior(x)     
          m2 = self.model2.posterior(x)
@@ -51,10 +54,10 @@ class ExpectedGradientCalculator():
          l =  torch.cholesky(cov_matrix + self.noise * torch.eye(len(x), dtype = torch.double, device = self.device))
          
          if (self.misspecified):
-             res = torch.max(chebyshev_scalar(m1.mean + l @ self.z, m2.mean + l @ self.z, self.reference, self.utilities) - self.min_val)
+             res = torch.max(chebyshev_scalar(m1.mean + l @ self.z, m2.mean + l @ self.z, self.reference, self.utilities) - self.max_val)
          else:
              input_x = x = torch.transpose(torch.stack((m1.mean + l @ self.z, m2.mean + l @ self.z), dim = 1).repeat(1, 1, len(x)), 1, 2)
-             res = torch.max(chebyshev_scalar_batch(input_x, self.reference, self.utilities) - self.min_val)
+             res = torch.max(chebyshev_scalar_batch(input_x, self.reference, self.utilities) - self.max_val)
          return torch.clamp(res, 0)
      
     def estimate_gradient(self, x, t = 0):
@@ -75,6 +78,8 @@ class ExpectedGradientCalculator():
         return accumulator / self.iterations
     
     def estimate_stationary(self, x, t = 0):
+        # returns the saddlepoint of the given optimization subroutine
+        
         accumulator = [x]
         previous = x.detach()
         previous.requires_grad = True
@@ -122,6 +127,9 @@ class ExpectedGradientCalculator():
         return x_copy
          
     def getNext(self, t = 0, n = None):
+        # outputs the next query point
+        # time controls the cost function
+        # if n is specified, then the result batch will have size of n
         best_point = None
         best_ei = None
         
@@ -152,6 +160,9 @@ class ExpectedGradientCalculator():
         return best_point
     
     def predict(self, x):
+        # outputs the inferred objective value of the two objective functions
+        # used for delayed environment imputation
+        
         m1 = self.model1.posterior(x)
         m2 = self.model2.posterior(x)
         
